@@ -1,0 +1,292 @@
+# =============================================================================
+# part6_walkforward_isoforest.py
+# Language: Python 3
+#
+# Walk-forward Isolation Forest on S&P 500 features (2015–2024)
+# -----------------------------------------------------------------------------
+# Purpose
+#   Train an Isolation Forest month-by-month in a walk-forward scheme on
+#   precomputed S&P 500 features, score anomalies out-of-sample, and export:
+#     - per-row predictions/scores,
+#     - annual anomaly rates,
+#     - RB vs ML overlap tables (by year and global).
+#
+# Ownership / Rights
+#   © 2025 (All rights reserved). Authored for an academic thesis.
+#   You may review and reuse the code. Do NOT redistribute third-party datasets.
+#   Publish the code; keep licensed data (e.g., WRDS/CRSP derivatives) private.
+#
+# Inputs (same folder)
+#   - sp500_anomaly_features_2015_2024.csv  (from your Part 5 script)
+#
+# Outputs (same folder)
+#   - ml_if_predictions_2015_2024.csv
+#   - B2_ml_anomaly_rates_by_year.csv
+#   - B3_overlap_rb_ml_by_year.csv
+#   - B3_overlap_global.csv
+#
+# Notes
+#   - Contamination is set per scored month (e.g., 1%).
+#   - Scaling can be "global" or "by_ticker"; winsorization optional.
+#   - Reproducibility: RANDOM_STATE fixed.
+# =============================================================================
+
+import os
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import StandardScaler
+
+# ---------------- Parameters (edit here) ----------------
+IN_FILE = "sp500_anomaly_features_2015_2024.csv"
+
+# Feature set (must match columns created in Part 5)
+FEATURES = [
+    "roll_ret_5", "roll_ret_20",
+    "roll_vol_20",
+    "zscore_20",
+    "momentum_21", "momentum_63",
+    "rsi_14", "bb_width"
+]
+
+# Isolation Forest configuration
+CONTAM_PER_MONTH = 0.01     # 1% outliers per month
+N_ESTIMATORS      = 300
+MAX_SAMPLES       = "auto"
+RANDOM_STATE      = 42
+N_JOBS            = -1      # use all available cores
+
+# Robustness toggles
+WINSOR_PCT   = None         # e.g., 0.01 for 1% winsorization; None to disable
+SCALING_MODE = "global"     # "global" or "by_ticker"
+
+# Training window lower bound (exclude warm-up periods before 2015-01-01)
+TRAIN_START  = pd.Timestamp("2015-01-01")
+# --------------------------------------------------------
+
+
+def winsorize_df(df: pd.DataFrame, cols: list[str], p: float) -> pd.DataFrame:
+    """Two-sided winsorization on selected columns. Not used directly in main (bounds are learned on train)."""
+    if p is None or p <= 0:
+        return df
+    df_w = df.copy()
+    for c in cols:
+        ql = df_w[c].quantile(p)
+        qh = df_w[c].quantile(1 - p)
+        df_w[c] = df_w[c].clip(ql, qh)
+    return df_w
+
+
+def scale_global(train_df: pd.DataFrame, test_df: pd.DataFrame, cols: list[str]):
+    """Fit a global StandardScaler on train; apply to train and test."""
+    scaler = StandardScaler()
+    train_vals = scaler.fit_transform(train_df[cols])
+    test_vals  = scaler.transform(test_df[cols])
+    train_scaled = train_df.copy()
+    test_scaled  = test_df.copy()
+    train_scaled[cols] = train_vals
+    test_scaled[cols]  = test_vals
+    return train_scaled, test_scaled
+
+
+def scale_by_ticker(train_df: pd.DataFrame, test_df: pd.DataFrame, cols: list[str]):
+    """
+    Fit one scaler per ticker using train rows of that ticker; apply to both
+    train and test rows of the same ticker. Rows for unseen tickers in test
+    fall back to a global scaler fitted on the entire train.
+    """
+    train_scaled = train_df.copy()
+    test_scaled  = test_df.copy()
+
+    # Global fallback
+    global_scaler = StandardScaler().fit(train_df[cols])
+
+    # Per-ticker scaling
+    for tic, tr in train_df.groupby("ticker"):
+        scaler = StandardScaler().fit(tr[cols])
+        idx_tr = train_df["ticker"] == tic
+        idx_te = test_df["ticker"] == tic
+        train_scaled.loc[idx_tr, cols] = scaler.transform(train_df.loc[idx_tr, cols])
+        if idx_te.any():
+            test_scaled.loc[idx_te, cols] = scaler.transform(test_df.loc[idx_te, cols])
+
+    # Any leftover rows (e.g., unseen tickers) → global scaler
+    mask_missing = test_scaled[cols].isna().any(axis=1)
+    if mask_missing.any():
+        test_scaled.loc[mask_missing, cols] = global_scaler.transform(test_df.loc[mask_missing, cols])
+
+    return train_scaled, test_scaled
+
+
+def month_iterator(df: pd.DataFrame):
+    """Yield (year, month) pairs present in the data, sorted."""
+    ym = df[["year", "month"]].drop_duplicates().sort_values(["year", "month"]).values
+    for y, m in ym:
+        yield int(y), int(m)
+
+
+def prepare_train_test(df: pd.DataFrame, y: int, m: int):
+    """Train on all rows strictly before the first day of (y, m); test on rows within (y, m)."""
+    month_start = pd.Timestamp(year=y, month=m, day=1)
+    nxt = (month_start + pd.offsets.MonthBegin(1))
+    train = df[(df["date"] < month_start) & (df["date"] >= TRAIN_START)].copy()
+    test  = df[(df["date"] >= month_start) & (df["date"] < nxt)].copy()
+    return train, test
+
+
+def fit_score_iforest(train: pd.DataFrame, test: pd.DataFrame, cols: list[str], contamination: float):
+    """Fit Isolation Forest on train, score test; return test rows with predictions and scores."""
+    if train.empty or test.empty:
+        return None
+
+    X_tr = train[cols].values
+    X_te = test[cols].values
+
+    clf = IsolationForest(
+        n_estimators=N_ESTIMATORS,
+        contamination=contamination,
+        max_samples=MAX_SAMPLES,
+        random_state=RANDOM_STATE,
+        n_jobs=N_JOBS,
+        verbose=0
+    )
+    clf.fit(X_tr)
+
+    # predict: -1 = outlier, 1 = inlier; decision_function: higher is more "normal"
+    pred  = clf.predict(X_te)
+    score = clf.decision_function(X_te)
+
+    out = test.copy()
+    out["if_raw"]     = pred
+    out["if_score"]   = score
+    out["ml_anomaly"] = (pred == -1).astype(int)
+    return out
+
+
+def main():
+    # -------- Load features --------
+    if not os.path.exists(IN_FILE):
+        raise FileNotFoundError(f"Input file not found: {IN_FILE}")
+    df = pd.read_csv(IN_FILE, parse_dates=["date"])
+
+    # Keep only needed columns (robust to missing RB flags)
+    base_cols = ["permno","date","ticker","comnam","siccd","in_index_flag","year","close","volume"]
+    rb_cols   = ["anomaly_flag","vol_anomaly","rsi_anomaly","bb_expansion_anom"]
+    keep      = list({*base_cols, *rb_cols, *FEATURES})
+    df = df[[c for c in keep if c in df.columns]].copy()
+
+    # Add month key and remove rows with missing features
+    df["month"] = df["date"].dt.month
+    df["ym"]    = df["date"].dt.to_period("M").astype(str)
+    df = df.dropna(subset=FEATURES).reset_index(drop=True)
+
+    # -------- Walk-forward over months --------
+    outputs = []
+    for (y, m) in month_iterator(df):
+        train, test = prepare_train_test(df, y, m)
+        if train.empty or test.empty:
+            continue
+
+        # Winsorization: learn bounds on train, apply to both train/test (ensures no look-ahead)
+        if WINSOR_PCT is not None and WINSOR_PCT > 0:
+            bounds = {}
+            for c in FEATURES:
+                ql = train[c].quantile(WINSOR_PCT)
+                qh = train[c].quantile(1 - WINSOR_PCT)
+                bounds[c] = (ql, qh)
+            for c, (ql, qh) in bounds.items():
+                train[c] = train[c].clip(ql, qh)
+                test[c]  = test[c].clip(ql,  qh)
+
+        # Scaling: global or by-ticker (fit only on train)
+        if SCALING_MODE == "global":
+            train_s, test_s = scale_global(train, test, FEATURES)
+        elif SCALING_MODE == "by_ticker":
+            train_s, test_s = scale_by_ticker(train, test, FEATURES)
+        else:
+            raise ValueError("SCALING_MODE must be 'global' or 'by_ticker'")
+
+        # Fit IF and score current month
+        out = fit_score_iforest(train_s, test_s, FEATURES, CONTAM_PER_MONTH)
+        if out is not None:
+            out["train_obs"] = len(train_s)  # transparency: training set size
+            out["y_train"]   = y             # for traceability if you regroup later
+            out["m_train"]   = m
+            outputs.append(out)
+
+        print(f"[INFO] Scored {y}-{m:02d}: test={len(test)} rows, train={len(train)} rows.")
+
+    if not outputs:
+        raise RuntimeError("No monthly outputs were produced. Check date ranges and TRAIN_START.")
+
+    preds = pd.concat(outputs, axis=0).sort_values(["date","permno"]).reset_index(drop=True)
+
+    # -------- Summaries & Exports --------
+    # Annual ML anomaly rates
+    annual = (
+        preds.groupby("year")
+             .agg(n_obs=("permno","count"),
+                  n_ml_anom=("ml_anomaly","sum"),
+                  pct_ml_anom=("ml_anomaly", lambda s: 100*s.mean()))
+             .reset_index()
+    )
+
+    # RB vs ML overlap (per year)
+    for c in ["anomaly_flag","vol_anomaly","rsi_anomaly","bb_expansion_anom"]:
+        if c not in preds.columns:
+            preds[c] = 0
+    preds["any_rule_anom"] = (
+        (preds["anomaly_flag"]==1) |
+        (preds["vol_anomaly"]==1) |
+        (preds["rsi_anomaly"]==1) |
+        (preds["bb_expansion_anom"]==1)
+    ).astype(int)
+
+    overlap_year = (
+        preds.groupby("year")
+             .apply(lambda g: pd.Series({
+                 "rb_only": int(((g["any_rule_anom"]==1) & (g["ml_anomaly"]==0)).sum()),
+                 "ml_only": int(((g["any_rule_anom"]==0) & (g["ml_anomaly"]==1)).sum()),
+                 "overlap": int(((g["any_rule_anom"]==1) & (g["ml_anomaly"]==1)).sum()),
+                 "none":    int(((g["any_rule_anom"]==0) & (g["ml_anomaly"]==0)).sum())
+             }))
+             .reset_index()
+    )
+
+    # Jaccard per year: |RB ∩ ML| / |RB ∪ ML|
+    overlap_year["jaccard"] = overlap_year["overlap"] / (
+        overlap_year["rb_only"] + overlap_year["ml_only"] + overlap_year["overlap"]
+    ).replace(0, np.nan)
+
+    # Global overlap (single row)
+    RB = (preds["any_rule_anom"]==1)
+    ML = (preds["ml_anomaly"]==1)
+    rb_only = int((RB & ~ML).sum())
+    ml_only = int((~RB & ML).sum())
+    inter   = int((RB & ML).sum())
+    union   = rb_only + ml_only + inter
+    jacc_global = (inter / union) if union > 0 else np.nan
+    overlap_global = pd.DataFrame([{
+        "rb_only": rb_only,
+        "ml_only": ml_only,
+        "overlap": inter,
+        "none": int((~RB & ~ML).sum()),
+        "jaccard": jacc_global
+    }])
+
+    # Write artifacts
+    preds.to_csv("ml_if_predictions_2015_2024.csv", index=False)
+    annual.to_csv("B2_ml_anomaly_rates_by_year.csv", index=False)
+    overlap_year.to_csv("B3_overlap_rb_ml_by_year.csv", index=False)
+    overlap_global.to_csv("B3_overlap_global.csv", index=False)
+
+    print(" Done.")
+    print(" - ml_if_predictions_2015_2024.csv")
+    print(" - B2_ml_anomaly_rates_by_year.csv")
+    print(" - B3_overlap_rb_ml_by_year.csv")
+    print(" - B3_overlap_global.csv")
+    print(f"Global Jaccard (RB vs ML): {jacc_global:.4f}")
+
+
+if __name__ == "__main__":
+    main()
