@@ -1,0 +1,335 @@
+# =============================================================================
+# part6b_survival_of_anomalies.py
+# Language: Python 3
+#
+# Survival analysis of ML-detected anomalies (monthly episodes)
+# -----------------------------------------------------------------------------
+# Purpose
+#   Convert daily ML anomaly flags into monthly per-ticker episodes, compute
+#   Kaplan–Meier survival curves (overall and by sector), and optionally fit
+#   a Cox proportional hazards model (if `lifelines` is available).
+#
+# Authorship / Rights
+#   © 2025 — All rights reserved by the author (thesis work).
+#   You may read and review this script. Do NOT redistribute third-party data
+#   (e.g., WRDS/CRSP derivatives). Publish the code; keep licensed data private.
+#
+# Input (same folder)
+#   - ml_if_predictions_2015_2024.csv   # produced by Part 6 (walk-forward IF)
+#
+# Outputs (same folder)
+#   - S1_km_survival_overall.csv / .png           # overall KM survival
+#   - S1_km_survival_by_sector.csv / .png         # sector-level KM (if enough data)
+#   - S2_cox_dataset.csv                          # episode-level design matrix
+#   - S2_cox_summary.txt (optional, if lifelines) # Cox summary table
+#   - S2_cox_forest.png   (optional, if lifelines)# Cox coefficients plot
+#
+# Notes
+#   - Episodes are consecutive months with ml_anomaly == 1 per ticker.
+#   - Right-censoring: last ongoing episode at sample end is censored (event=0).
+#   - Sector is a coarse mapping from SIC codes; adapt `sic_to_sector()` as needed.
+#   - `lifelines` is optional; script still produces KM + dataset without it.
+# =============================================================================
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from datetime import datetime
+
+# --------------------------- Config ---------------------------
+IN_FILE = "ml_if_predictions_2015_2024.csv"
+
+# Candidate covariates (the script auto-skips those missing from the input)
+COVARIATE_CANDIDATES = [
+    "roll_vol_20", "zscore_20", "momentum_21", "momentum_63", "rsi_14", "bb_width"
+]
+
+# ---------------- Sector mapping (SIC -> coarse buckets) ----------------
+def sic_to_sector(sic):
+    """
+    Map integer SIC codes to a small set of coarse sectors.
+    Customize this if you prefer GICS or a different partition.
+    """
+    try:
+        s = int(sic)
+    except Exception:
+        return "Unknown"
+    if 100 <= s < 1000:
+        return "Agriculture"
+    if 1000 <= s < 1500:
+        return "Mining"
+    if 1500 <= s < 1800:
+        return "Construction"
+    if 2000 <= s < 4000:
+        return "Manufacturing"
+    if 4000 <= s < 4900:
+        return "Transportation & Comm"
+    if 4900 <= s < 5000:
+        return "Utilities"
+    if 5000 <= s < 5200:
+        return "Wholesale"
+    if 5200 <= s < 6000:
+        return "Retail"
+    if 6000 <= s < 6800:
+        return "Finance"
+    if 7000 <= s < 9000:
+        return "Services"
+    if 9100 <= s < 9800:
+        return "Public Admin"
+    return "Other"
+
+# --------------------------- Helpers ---------------------------
+
+def month_start(dt):
+    """First day of the month for a given Timestamp."""
+    return pd.Timestamp(year=dt.year, month=dt.month, day=1)
+
+def build_monthly_panel(preds: pd.DataFrame):
+    """
+    Collapse daily predictions to a monthly panel per (ticker, permno).
+    For each month:
+      - ml_anomaly: 1 if any daily anomaly in that month (max)
+      - siccd:      carried via max() (acts like 'last' numerically)
+      - covariates: monthly mean if present in input
+    Returns:
+      monthly (DataFrame), covars_present (list of covariate columns found)
+    """
+    df = preds.copy()
+    df["date"] = pd.to_datetime(df["date"])
+
+    # Use normalized month start for grouping/ordering (YYYY-MM-01)
+    df["month_start"] = df["date"].dt.to_period("M").dt.to_timestamp()
+
+    # Identify covariates that actually exist in the input file
+    covars = [c for c in COVARIATE_CANDIDATES if c in df.columns]
+
+    # Aggregations at monthly level
+    agg_dict = {"ml_anomaly": "max", "siccd": "max"}
+    for c in covars:
+        agg_dict[c] = "mean"
+
+    monthly = (
+        df.groupby(["ticker", "permno", "month_start"], as_index=False)
+          .agg(agg_dict)
+    )
+
+    # Map SIC to coarse sector buckets
+    monthly["sector"] = monthly["siccd"].apply(sic_to_sector)
+
+    # Order for downstream episode building
+    monthly = monthly.sort_values(["ticker", "month_start"]).reset_index(drop=True)
+    return monthly, covars
+
+def build_episodes(monthly: pd.DataFrame):
+    """
+    Build episodes of consecutive months with ml_anomaly == 1 for each ticker.
+
+    Returns an episode-level DataFrame with:
+      - ticker, permno
+      - start_month, end_month
+      - duration_months (integer)
+      - event_observed (1 if episode ended within sample, 0 if right-censored)
+      - sector
+      - covariates at the episode start (one row per episode)
+    """
+    episodes = []
+    last_month = monthly["month_start"].max()  # for right-censoring at sample end
+
+    for tic, g in monthly.groupby("ticker", sort=False):
+        g = g.sort_values("month_start").reset_index(drop=True)
+        flags = g["ml_anomaly"].values.astype(int)
+
+        # Run-length encode anomalous segments (allowing ~monthly continuity)
+        i, n = 0, len(g)
+        while i < n:
+            if flags[i] == 1:
+                # Start of an episode
+                start_idx = i
+                j = i + 1
+                # Extend episode while consecutive months remain anomalous
+                while j < n and flags[j] == 1 and (g.loc[j, "month_start"] - g.loc[j-1, "month_start"]).days <= 35:
+                    j += 1
+                end_idx = j - 1
+
+                start_month = g.loc[start_idx, "month_start"]
+                end_month   = g.loc[end_idx,   "month_start"]
+                # Count months inclusively
+                duration = (end_month.to_period("M") - start_month.to_period("M")).n + 1
+
+                # Event observed?
+                # - If the episode reaches the last sample month, mark as censored (0).
+                # - Otherwise, if next row exists:
+                #    event = 1 if next flag is 0 or there is a time gap.
+                if end_idx == n - 1 and end_month == last_month:
+                    event = 0  # right-censored at sample end
+                else:
+                    if end_idx < n - 1:
+                        next_gap = (g.loc[end_idx+1, "month_start"] - end_month).days > 35
+                        event = 1 if flags[end_idx+1] == 0 or next_gap else 0
+                    else:
+                        event = 1  # ended before final month
+
+                row = {
+                    "ticker": tic,
+                    "permno": g.loc[start_idx, "permno"],
+                    "start_month": start_month,
+                    "end_month": end_month,
+                    "duration_months": int(duration),
+                    "event_observed": int(event),
+                    "sector": g.loc[start_idx, "sector"]
+                }
+
+                # Capture covariates at episode start month (if present)
+                cov_cols = [c for c in g.columns if c in COVARIATE_CANDIDATES]
+                for c in cov_cols:
+                    row[c] = g.loc[start_idx, c]
+
+                episodes.append(row)
+                i = j  # jump to first non-episode row
+            else:
+                i += 1
+
+    epi = pd.DataFrame(episodes)
+    if not epi.empty:
+        epi = epi.sort_values(["start_month", "ticker"]).reset_index(drop=True)
+    return epi
+
+def km_fit(durations, events):
+    """
+    Kaplan–Meier estimator (product-limit):
+      durations: integer episode lengths in months
+      events:    1 if episode ended, 0 if censored
+    Returns a DataFrame with time grid and survival S(t).
+    """
+    df = pd.DataFrame({"T": durations.astype(int), "E": events.astype(int)})
+    times = np.sort(df["T"].unique())          # distinct event/censor times
+    n_at_risk, n_events, S = [], [], []
+    surv, N = 1.0, len(df)
+
+    for t in times:
+        # At risk just before t: all with T >= t
+        r = (df["T"] >= t).sum()
+        d = ((df["T"] == t) & (df["E"] == 1)).sum()
+        n_at_risk.append(r)
+        n_events.append(d)
+        if r > 0:
+            surv *= (1.0 - d / r)
+        S.append(surv)
+
+    return pd.DataFrame({
+        "time_months": times,
+        "n_at_risk": n_at_risk,
+        "n_events": n_events,
+        "S": S
+    })
+
+# --------------------------- Main ---------------------------
+
+def main():
+    # ---- Load predictions from Part 6 ----
+    preds = pd.read_csv(IN_FILE, parse_dates=["date"])
+    required = {"permno","date","ticker","siccd","ml_anomaly"}
+    missing = required - set(preds.columns)
+    if missing:
+        raise ValueError(f"Missing required columns in {IN_FILE}: {missing}")
+
+    # ---- Build monthly panel and episodes ----
+    monthly, covars_present = build_monthly_panel(preds)
+    epi = build_episodes(monthly)
+    if epi.empty:
+        raise RuntimeError("No ML anomaly episodes found. Check input or flags.")
+
+    # Save episode-level design matrix (used also for Cox)
+    epi.to_csv("S2_cox_dataset.csv", index=False)
+    print(f"Episodes built: {len(epi)} (saved S2_cox_dataset.csv)")
+
+    # ---- Kaplan–Meier overall ----
+    km_overall = km_fit(epi["duration_months"].values, epi["event_observed"].values)
+    km_overall.to_csv("S1_km_survival_overall.csv", index=False)
+
+    plt.figure(figsize=(7,5))
+    plt.step(km_overall["time_months"], km_overall["S"], where="post")
+    plt.title("Survival of ML Anomalies (Kaplan–Meier)")
+    plt.xlabel("Duration (months)")
+    plt.ylabel("Survival probability S(t)")
+    plt.grid(True, alpha=0.4, linestyle="--")
+    plt.tight_layout()
+    plt.savefig("S1_km_survival_overall.png", dpi=200)
+    plt.close()
+    print("Kaplan–Meier (overall) saved: S1_km_survival_overall.csv / .png")
+
+    # ---- Kaplan–Meier by sector (if enough episodes per sector) ----
+    frames = []
+    for sec, g in epi.groupby("sector"):
+        if len(g) < 5:  # skip tiny groups to avoid noisy curves
+            continue
+        km = km_fit(g["duration_months"].values, g["event_observed"].values)
+        km["sector"] = sec
+        frames.append(km)
+
+    if frames:
+        km_by_sector = pd.concat(frames, axis=0).reset_index(drop=True)
+        km_by_sector.to_csv("S1_km_survival_by_sector.csv", index=False)
+
+        plt.figure(figsize=(8,6))
+        for sec in sorted(km_by_sector["sector"].unique()):
+            gg = km_by_sector[km_by_sector["sector"] == sec]
+            plt.step(gg["time_months"], gg["S"], where="post", label=sec)
+        plt.title("Survival of ML Anomalies by Sector (Kaplan–Meier)")
+        plt.xlabel("Duration (months)")
+        plt.ylabel("Survival probability S(t)")
+        plt.grid(True, alpha=0.4, linestyle="--")
+        plt.legend(ncol=2, fontsize=8)
+        plt.tight_layout()
+        plt.savefig("S1_km_survival_by_sector.png", dpi=200)
+        plt.close()
+        print("Kaplan–Meier by sector saved: S1_km_survival_by_sector.csv / .png")
+    else:
+        print("ℹNot enough episodes per sector to produce by-sector KM curves.")
+
+    # ---- Optional Cox PH model (if `lifelines` is installed) ----
+    try:
+        from lifelines import CoxPHFitter
+
+        # Prepare Cox design: durations/events + numeric covariates (+ sector dummies)
+        cox_df = epi.copy()
+        cox_df["T"] = cox_df["duration_months"]
+        cox_df["E"] = cox_df["event_observed"]
+
+        if "sector" in cox_df.columns:
+            cox_df = pd.get_dummies(cox_df, columns=["sector"], drop_first=True)
+
+        numeric_cols = cox_df.select_dtypes(include=[np.number]).columns.tolist()
+        keep_cols = list(set(numeric_cols) | {"T","E"})
+        cox_df = cox_df[keep_cols].dropna()
+
+        cph = CoxPHFitter()
+        cph.fit(cox_df, duration_col="T", event_col="E")
+        cph.print_summary()
+
+        with open("S2_cox_summary.txt", "w") as f:
+            f.write(str(cph.summary))
+        print("✅ Cox model fitted and summary saved to S2_cox_summary.txt")
+
+        # Optional: coefficient plot
+        try:
+            ax = cph.plot()
+            plt.title("Cox PH – Log Hazard Ratios")
+            plt.tight_layout()
+            plt.savefig("S2_cox_forest.png", dpi=200)
+            plt.close()
+            print("Cox forest plot saved: S2_cox_forest.png")
+        except Exception as e:
+            print(f"Plotting Cox coefficients failed: {e}")
+
+    except Exception as e:
+        # Graceful fallback if lifelines is not installed
+        print("lifelines not available; skipping Cox fit.")
+        print("   Install with: pip install lifelines")
+        print("   We exported S2_cox_dataset.csv so you can fit Cox later.")
+
+    print("All done.")
+
+if __name__ == "__main__":
+    main()
