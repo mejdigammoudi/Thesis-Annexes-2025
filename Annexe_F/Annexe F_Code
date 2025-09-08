@@ -1,0 +1,496 @@
+# =============================================================================
+# partE_tff_sp500_link.py
+# Language: Python 3
+#
+# CFTC TFF (Traders in Financial Futures) ↔ ML Anomaly Rate (S&P 500)
+# -----------------------------------------------------------------------------
+# Purpose
+#   1) Read all TFF Excel files in the working directory (and subfolders),
+#      robustly parse dates/columns, and extract S&P 500 futures positioning
+#      (spec groups: Asset Manager, Leveraged Money, Other Reportables).
+#   2) Aggregate to weekly, then monthly, and build a z-score signal for S&P 500.
+#   3) Load monthly ML anomaly rates derived from Part 6 (Isolation Forest) and
+#      merge with TFF signals for descriptive analysis (plots, correlations,
+#      simple logit, and a tiny event study).
+#
+# Authorship / Rights
+#   © 2025 — All rights reserved by the author (thesis work).
+#   You may read and review this script. Do NOT redistribute third-party data
+#   (e.g., WRDS/CRSP derivatives from earlier parts). Publish the code; keep
+#   licensed data private. CFTC TFF files are public (US Gov), but confirm your
+#   local licensing/attribution policy.
+#
+# Inputs (same folder or subfolders)
+#   - One or more *.xlsx TFF “Combined” spreadsheets (CFTC)  [scanned recursively]
+#   - ml_if_predictions_2015_2024.csv  (from Part 6)
+#
+# Outputs
+#   - E1_tff_sp500_monthly.csv              # monthly S&P 500 TFF net + z
+#   - E2_anomaly_rate_monthly_sp500.csv     # monthly ML anomaly rate
+#   - E3_sp500_cot_anomaly_merged.csv       # merged monthly dataset
+#   - E3b_sp500_anomaly_leadlag_corr.csv    # lead/lag correlations
+#   - E4_sp500_logit_summary.txt, E4_sp500_logit_odds_ratios.csv  (optional)
+#   - E5_sp500_event_study_tff_extremes.csv (optional)
+#   - P1_tff_sp500_net_z.png
+#   - P2_anomaly_vs_tff_sp500.png
+#   - P3_sp500_event_study_extremes.png
+#
+# Notes
+#   - The S&P 500 contract detection is robust to naming variants (E-mini/Micro).
+#   - Date parsing handles ISO strings, Excel serials, 8-digit/6-digit dates, etc.
+#   - Statsmodels is optional; if missing, the logit step is skipped gracefully.
+# =============================================================================
+
+from pathlib import Path
+import re
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# ==================== CONFIG ====================
+DATA_DIR = Path(".")
+FILE_ML  = DATA_DIR / "ml_if_predictions_2015_2024.csv"
+
+# TFF groups included in the "speculative" bucket (sum of long/short)
+# Available keys: "asset_mgr", "lev_money", "other_rept"
+SPEC_GROUPS = ["asset_mgr", "lev_money"]
+
+# Rolling window (weeks) for z-score and anomaly surge threshold
+Z_WIN_WEEKS    = 52
+SURGE_QUANTILE = 0.90
+# =================================================
+
+
+# ---------------- Utility helpers ----------------
+def _norm_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize column names: lower-case, spaces -> underscores."""
+    return df.rename(columns={c: re.sub(r"\s+", "_", str(c)).strip().lower() for c in df.columns})
+
+def _candidate_date_cols(cols: list[str]) -> list[str]:
+    """Preferred date columns for TFF Combined; fall back to anything containing 'date'."""
+    pref = [
+        "report_date_as_yyyymmdd",
+        "report_date_as_mm_dd_yyyy",
+        "report_date_as_yyyy_mm_dd",
+        "report_date_as_yyyy-mm-dd",
+        "as_of_date_in_form_yyyymmdd",
+        "as_of_date_in_form_yymmdd",
+        "report_date",
+    ]
+    out = [c for c in pref if c in cols]
+    out += [c for c in cols if ("date" in c) and (c not in out)]
+    return out
+
+def _parse_any_date(series: pd.Series) -> pd.Series:
+    """
+    Robust date parsing:
+      - native datetimes
+      - Excel serial numbers
+      - flexible text formats (ISO, MM_DD_YYYY, DD_MM_YYYY, YYYYMMDD, YYMMDD)
+    """
+    s = series
+
+    # already datetime
+    if pd.api.types.is_datetime64_any_dtype(s):
+        return pd.to_datetime(s, errors="coerce")
+
+    # Excel serial if numeric
+    if pd.api.types.is_numeric_dtype(s):
+        base = pd.Timestamp("1899-12-30")
+        return (base + pd.to_timedelta(s.astype("float"), unit="D")).dt.normalize()
+
+    raw = s.astype(str).str.strip()
+    parsed = pd.to_datetime(raw, errors="coerce")  # handles many cases
+
+    miss = parsed.isna()
+    if miss.any():
+        parsed.loc[miss] = pd.to_datetime(raw[miss], format="%m_%d_%Y", errors="coerce")
+    miss = parsed.isna()
+    if miss.any():
+        parsed.loc[miss] = pd.to_datetime(raw[miss], format="%d_%m_%Y", errors="coerce")
+
+    miss = parsed.isna()
+    if miss.any():
+        ymd8 = raw[miss].str.extract(r"(\d{8})", expand=False)
+        parsed.loc[miss] = pd.to_datetime(ymd8, format="%Y%m%d", errors="coerce")
+
+    miss = parsed.isna()
+    if miss.any():
+        ymd6 = raw[miss].str.extract(r"(\d{6})", expand=False)
+        parsed.loc[miss] = pd.to_datetime(ymd6, format="%y%m%d", errors="coerce")
+
+    miss = parsed.isna()
+    if miss.any():
+        as_num = pd.to_numeric(raw[miss], errors="coerce")
+        mask_num = as_num.notna()
+        if mask_num.any():
+            base = pd.Timestamp("1899-12-30")
+            parsed.loc[miss[miss].index[mask_num]] = (
+                base + pd.to_timedelta(as_num[mask_num].astype(float), unit="D")
+            ).dt.normalize()
+
+    return pd.to_datetime(parsed, errors="coerce")
+
+
+# ------------- Load all TFF "Combined" Excel files -------------
+def _load_all_tff_excels(folder: Path) -> pd.DataFrame:
+    """
+    Recursively load all *.xlsx files, try each sheet, and extract a normalized
+    subset of TFF columns (date/name/OI + long/short by group).
+    """
+    files = sorted(folder.rglob("*.xlsx"))
+    print(f"Found {len(files)} Excel file(s) under {folder.resolve()}")
+    if not files:
+        raise SystemExit("No TFF Excel files (.xlsx) found.")
+
+    frames = []
+    for f in files:
+        try:
+            xls = pd.ExcelFile(f, engine="openpyxl")
+        except Exception as e:
+            print(f"Cannot open {f.name}: {e}")
+            continue
+
+        got = False
+        for sh in xls.sheet_names:
+            try:
+                df = xls.parse(sh)
+            except Exception as e:
+                print(f"   └─ skip {f.name}::{sh}: {e}")
+                continue
+
+            df = _norm_cols(df)
+            cols = df.columns.tolist()
+
+            # Column aliases (TFF Combined is not perfectly consistent)
+            name_cols = ["market_and_exchange_names", "market_and_exchange_name"]
+            oi_cols   = ["open_interest_all", "open_interest_all_"]
+
+            dealer_l = ["dealer_positions_long_all"]
+            dealer_s = ["dealer_positions_short_all"]
+
+            am_l = ["asset_mgr_positions_long_all", "asset_manager_positions_long_all"]
+            am_s = ["asset_mgr_positions_short_all", "asset_manager_positions_short_all"]
+
+            lev_l = ["lev_money_positions_long_all", "leveraged_money_positions_long_all", "leveraged_funds_positions_long_all"]
+            lev_s = ["lev_money_positions_short_all", "leveraged_money_positions_short_all", "leveraged_funds_positions_short_all"]
+
+            oth_l = ["other_rept_positions_long_all", "other_reportables_positions_long_all"]
+            oth_s = ["other_rept_positions_short_all", "other_reportables_positions_short_all"]
+
+            def pick(cands):
+                for cc in cands:
+                    if cc in df.columns:
+                        return cc
+                return None
+
+            # --- Date: try candidates until one parses to non-NaN
+            date_candidates = _candidate_date_cols(cols)
+            used_date_col = None
+            parsed_date = None
+            for dc in date_candidates:
+                tmp = _parse_any_date(df[dc])
+                if tmp.notna().sum() > 0:
+                    used_date_col = dc
+                    parsed_date = tmp
+                    break
+
+            col_name = pick(name_cols)
+            col_oi   = pick(oi_cols)
+            col_d_l  = pick(dealer_l);  col_d_s  = pick(dealer_s)
+            col_am_l = pick(am_l);      col_am_s = pick(am_s)
+            col_lv_l = pick(lev_l);     col_lv_s = pick(lev_s)
+            col_or_l = pick(oth_l);     col_or_s = pick(oth_s)
+
+            if used_date_col is None or col_name is None or col_oi is None:
+                print(f"   └─ {f.name}::{sh}: missing date/name/oi. cols[:15]={cols[:15]}")
+                continue
+
+            # Build a normalized frame
+            out = pd.DataFrame({
+                "Report_Date": parsed_date,
+                "Market_and_Exchange_Names": df[col_name].astype(str),
+                "Open_Interest_All": pd.to_numeric(
+                    df[col_oi].astype(str).str.replace(",", "", regex=False),
+                    errors="coerce"
+                ),
+            })
+
+            # Helper to add numeric columns if present
+            def add_num(col_src, col_dst):
+                if col_src is not None and col_src in df.columns:
+                    out[col_dst] = pd.to_numeric(
+                        df[col_src].astype(str).str.replace(",", "", regex=False),
+                        errors="coerce"
+                    )
+
+            add_num(col_d_l,  "Dealer_Positions_Long_All")
+            add_num(col_d_s,  "Dealer_Positions_Short_All")
+            add_num(col_am_l, "Asset_Mgr_Positions_Long_All")
+            add_num(col_am_s, "Asset_Mgr_Positions_Short_All")
+            add_num(col_lv_l, "Lev_Money_Positions_Long_All")
+            add_num(col_lv_s, "Lev_Money_Positions_Short_All")
+            add_num(col_or_l, "Other_Rept_Positions_Long_All")
+            add_num(col_or_s, "Other_Rept_Positions_Short_All")
+
+            before = len(out)
+            out = out.dropna(subset=["Report_Date", "Open_Interest_All"])
+            after = len(out)
+            if after == 0:
+                print(f"   └─ {f.name}::{sh}: no valid rows after parse (date_col='{used_date_col}').")
+                continue
+
+            frames.append(out)
+            got = True
+            print(f"   ↳ {f.name}::{sh}: date_col='{used_date_col}', rows_kept={after}/{before}")
+
+        print(f"{f.name}: kept={got}")
+
+    if not frames:
+        raise SystemExit("No valid sheets/columns found in TFF Excel files.")
+
+    # Concatenate all sheets/files
+    cot = pd.concat(frames, ignore_index=True).drop_duplicates()
+    return cot
+
+
+# ----- S&P 500 contract name filter -----
+def is_sp500_name(raw_name: str) -> bool:
+    """
+    Robust detection of S&P 500 futures names (E-mini / Micro), tolerant to
+    spacing, hyphens, 'SP' vs 'S&P', and 'Standard & Poors'.
+    Excludes VIX/volatility tickers explicitly.
+    """
+    if not isinstance(raw_name, str):
+        return False
+    s = raw_name.upper()
+    s = re.sub(r"[\s\-]+", " ", s).strip()
+
+    # Exclude volatility index
+    if "VIX" in s or "VOLATILITY" in s:
+        return False
+
+    patterns = [
+        r"\bS&?P\s*500\b",                 # S&P 500 / SP 500 / S P 500
+        r"\bE\s*MINI\b.*S&?P\s*500\b",     # E-MINI S&P 500
+        r"\bMICRO\s+E\s*MINI\b.*S&?P\s*500\b",
+        r"STANDARD\s*(?:AND|&)\s*POORS.*\b500\b",
+        r"\bS&P\b.*\bSTOCK\s*INDEX\b.*\b500\b",
+    ]
+    if any(re.search(p, s) for p in patterns):
+        return True
+
+    # Fallback: contains SP/S&P AND '500'
+    if (("S&P" in s or "SP " in s or "S P " in s) and "500" in s):
+        return True
+
+    return False
+
+
+# ----------------- TFF → Monthly S&P 500 aggregates -----------------
+def build_sp500_monthly() -> pd.DataFrame:
+    """
+    Build monthly S&P 500 speculative positioning:
+      - sum of chosen spec groups (long/short) → net, and net share vs OI
+      - weekly OI-weighted average of net share → monthly last
+      - rolling 52-week z-score on weekly net share
+    """
+    cot = _load_all_tff_excels(DATA_DIR)
+
+    if cot.empty:
+        print("No records after loading. Check column mapping.")
+    elif cot["Report_Date"].isna().all():
+        print("All dates are NaT. First rows:", cot["Report_Date"].astype(str).head().tolist())
+
+    cot["date"] = cot["Report_Date"]
+    cot["name"] = cot["Market_and_Exchange_Names"].astype(str)
+
+    years_found = sorted(cot["date"].dt.year.dropna().unique().tolist())
+    print(f"Years present in TFF: {years_found}")
+
+    # Strict S&P 500 filter
+    eq = cot.loc[cot["name"].apply(is_sp500_name)].copy()
+    if eq.empty:
+        out = DATA_DIR / "DEBUG_market_names_TFF_SP500.csv"
+        cot["name"].dropna().astype(str).drop_duplicates().to_csv(out, index=False)
+        raise SystemExit(f"No SP500 contract matched. Wrote unique names to {out}")
+
+    # Build speculative long/short from chosen groups
+    parts_long, parts_short = [], []
+    if "asset_mgr" in SPEC_GROUPS:
+        if "Asset_Mgr_Positions_Long_All" in eq.columns:  parts_long.append(eq["Asset_Mgr_Positions_Long_All"].fillna(0))
+        if "Asset_Mgr_Positions_Short_All" in eq.columns: parts_short.append(eq["Asset_Mgr_Positions_Short_All"].fillna(0))
+    if "lev_money" in SPEC_GROUPS:
+        if "Lev_Money_Positions_Long_All" in eq.columns:  parts_long.append(eq["Lev_Money_Positions_Long_All"].fillna(0))
+        if "Lev_Money_Positions_Short_All" in eq.columns: parts_short.append(eq["Lev_Money_Positions_Short_All"].fillna(0))
+    if "other_rept" in SPEC_GROUPS:
+        if "Other_Rept_Positions_Long_All" in eq.columns:  parts_long.append(eq["Other_Rept_Positions_Long_All"].fillna(0))
+        if "Other_Rept_Positions_Short_All" in eq.columns: parts_short.append(eq["Other_Rept_Positions_Short_All"].fillna(0))
+
+    if parts_long and parts_short:
+        # Element-wise sums (Series align by index)
+        eq["spec_long"]  = np.sum(parts_long, axis=0)
+        eq["spec_short"] = np.sum(parts_short, axis=0)
+    else:
+        raise SystemExit(f"SPEC_GROUPS={SPEC_GROUPS} doesn't map to any TFF columns present.")
+
+    eq["spec_net"]  = eq["spec_long"] - eq["spec_short"]
+    eq["net_share"] = eq["spec_net"] / eq["Open_Interest_All"].replace(0, np.nan)
+
+    # Weekly aggregation (OI-weighted net share), then compute rolling z
+    weekly = (eq.groupby("date", as_index=False)
+              .apply(lambda g: pd.Series({
+                  "oi_total": g["Open_Interest_All"].sum(),
+                  "net_share_w": np.average(
+                      g["net_share"].fillna(0),
+                      weights=g["Open_Interest_All"].fillna(0)
+                  )
+              }))
+              .reset_index(drop=True)
+              .sort_values("date"))
+
+    mu = weekly["net_share_w"].rolling(Z_WIN_WEEKS, min_periods=12).mean()
+    sd = weekly["net_share_w"].rolling(Z_WIN_WEEKS, min_periods=12).std()
+    weekly["net_share_z"] = (weekly["net_share_w"] - mu) / sd
+
+    # Monthly last observation
+    weekly["month"] = weekly["date"].dt.to_period("M").dt.to_timestamp()
+    monthly = weekly.groupby("month", as_index=False).last()
+    monthly.rename(columns={"net_share_w": "cot_net_share_sp500", "net_share_z": "cot_net_z_sp500"}, inplace=True)
+    monthly.to_csv(DATA_DIR / "E1_tff_sp500_monthly.csv", index=False)
+    return monthly
+
+
+# ---------------- Monthly ML anomaly rate (S&P 500) ----------------
+def load_anomaly_monthly(file_ml: Path) -> pd.DataFrame:
+    """
+    Collapse daily ML predictions to monthly S&P 500 anomaly rate:
+      - tm_flag (per ticker, per month) = max of daily ml_anomaly
+      - anomaly_rate (per month) = mean of tm_flag across tickers
+    """
+    if not file_ml.exists():
+        raise SystemExit(f"Missing ML file: {file_ml}")
+    df = pd.read_csv(file_ml, parse_dates=["date"])
+    needed = {"date", "ticker", "ml_anomaly"}
+    miss = needed - set(df.columns)
+    if miss:
+        raise SystemExit(f"Missing columns in {file_ml.name}: {miss}")
+
+    df["month"] = df["date"].dt.to_period("M").dt.to_timestamp()
+    tm = (df.groupby(["ticker","month"], as_index=False)["ml_anomaly"]
+            .max().rename(columns={"ml_anomaly":"tm_flag"}))
+    m_rate = (tm.groupby("month", as_index=False)["tm_flag"]
+                .mean().rename(columns={"tm_flag":"anomaly_rate"}))
+    m_rate.to_csv(DATA_DIR / "E2_anomaly_rate_monthly_sp500.csv", index=False)
+    return m_rate
+
+
+# ------------- Merge, analyze, and plot (S&P 500 only) -------------
+def merge_and_analyze_sp500(cot_m: pd.DataFrame, anom_m: pd.DataFrame) -> None:
+    """
+    Merge monthly TFF z-score with monthly ML anomaly rate, then:
+      - create lead/lag versions of the TFF z
+      - compute surge threshold for anomaly rate
+      - save plots (levels and overlay), correlations, optional logit
+      - simple event study around extreme TFF z months
+    """
+    m = pd.merge(anom_m, cot_m, on="month", how="inner").sort_values("month")
+
+    # Lead/lag versions of TFF z (negative k = lead; positive k = lag)
+    for k in [-2, -1, 0, 1, 2]:
+        m[f"cot_sp500_z_l{k}"] = m["cot_net_z_sp500"].shift(-k)
+
+    # Surge months = top SURGE_QUANTILE of anomaly rate
+    thr = m["anomaly_rate"].quantile(SURGE_QUANTILE)
+    m["surge"] = (m["anomaly_rate"] >= thr).astype(int)
+    m.to_csv(DATA_DIR / "E3_sp500_cot_anomaly_merged.csv", index=False)
+
+    # --- Plots ---
+    # Overlay: monthly anomaly rate vs TFF z
+    plt.figure(figsize=(9,4))
+    ax = plt.gca(); ax2 = ax.twinx()
+    ax.plot(m["month"], m["anomaly_rate"], label="ML anomaly rate", linewidth=1.5)
+    ax2.plot(m["month"], m["cot_net_z_sp500"], label="TFF net (z) — S&P 500", linestyle="--")
+    ax.set_ylabel("Anomaly rate"); ax2.set_ylabel("TFF net z (SP500)")
+    ax.set_title("Monthly ML Anomaly Rate vs TFF Net (z) — S&P 500 only")
+    ax.grid(True, alpha=0.3, linestyle="--")
+    ax.legend(loc="upper left"); ax2.legend(loc="upper right")
+    plt.tight_layout(); plt.savefig(DATA_DIR / "P2_anomaly_vs_tff_sp500.png", dpi=200); plt.close()
+
+    # TFF z level plot
+    plt.figure(figsize=(7,4))
+    plt.plot(m["month"], m["cot_net_z_sp500"], linewidth=1.3)
+    plt.axhline(0, color="gray", linewidth=0.8)
+    plt.title("TFF Net — z-score (S&P 500)")
+    plt.ylabel("z-score"); plt.grid(True, alpha=0.3, linestyle="--")
+    plt.tight_layout(); plt.savefig(DATA_DIR / "P1_tff_sp500_net_z.png", dpi=200); plt.close()
+
+    # Lead/lag correlations
+    rows = []
+    for k in [-2, -1, 0, 1, 2]:
+        corr = m[["anomaly_rate", f"cot_sp500_z_l{k}"]].dropna().corr().iloc[0,1]
+        rows.append({"lag_k": k, "corr": corr})
+    pd.DataFrame(rows).to_csv(DATA_DIR / "E3b_sp500_anomaly_leadlag_corr.csv", index=False)
+
+    # --- Optional: logit of surge ~ contemporaneous & ±1 month TFF z ---
+    try:
+        import statsmodels.api as sm
+        X = m[["cot_sp500_z_l0","cot_sp500_z_l-1","cot_sp500_z_l1"]].copy()
+        X = sm.add_constant(X, has_constant="add")
+        y = m["surge"]
+        logit = sm.Logit(y.dropna(), X.loc[y.dropna().index]).fit(disp=False)
+        with open(DATA_DIR / "E4_sp500_logit_summary.txt","w") as f:
+            f.write(str(logit.summary()))
+        pd.DataFrame({
+            "var": logit.params.index,
+            "odds_ratio": np.exp(logit.params.values),
+            "pvalue": logit.pvalues.values
+        }).to_csv(DATA_DIR / "E4_sp500_logit_odds_ratios.csv", index=False)
+    except Exception as e:
+        print("Statsmodels not available or logit failed; skipping logit.")
+        print(e)
+
+    # --- Simple event study around extreme TFF z months ---
+    q_hi, q_lo = m["cot_net_z_sp500"].quantile(0.90), m["cot_net_z_sp500"].quantile(0.10)
+    events = m[(m["cot_net_z_sp500"] >= q_hi) | (m["cot_net_z_sp500"] <= q_lo)][["month"]].copy()
+    events["event"] = np.where(
+        m.set_index("month").loc[events["month"],"cot_net_z_sp500"].values >= q_hi,
+        "High", "Low"
+    )
+
+    m_idx = m.set_index("month")
+    rows = []
+    for _, r in events.iterrows():
+        t0 = r["month"]
+        for h in range(-3, 4):
+            t = (t0.to_period("M") + h).to_timestamp()
+            if t in m_idx.index:
+                rows.append({
+                    "event_month": t0, "horizon": h, "event_type": r["event"],
+                    "anomaly_rate": m_idx.loc[t,"anomaly_rate"]
+                })
+    ev = pd.DataFrame(rows)
+    if not ev.empty:
+        ev.groupby(["event_type","horizon"], as_index=False)["anomaly_rate"].mean() \
+          .to_csv(DATA_DIR / "E5_sp500_event_study_tff_extremes.csv", index=False)
+        piv = ev.groupby(["event_type","horizon"])["anomaly_rate"].mean().unstack(0)
+        plt.figure(figsize=(7,4))
+        for c in piv.columns:
+            plt.plot(piv.index, piv[c], marker="o", label=c)
+        plt.axvline(0, color="gray", linestyle="--", linewidth=1)
+        plt.title("Event Study: ML Anomaly Rate around TFF z-extremes (S&P 500)")
+        plt.xlabel("Months relative to TFF extreme (0)")
+        plt.ylabel("Avg anomaly rate")
+        plt.grid(True, alpha=0.3, linestyle="--"); plt.legend()
+        plt.tight_layout(); plt.savefig(DATA_DIR / "P3_sp500_event_study_extremes.png", dpi=200); plt.close()
+
+    print("Done (SP500): E1..E5 CSVs & P1..P3 plots created.")
+
+
+def main():
+    cot_m  = build_sp500_monthly()
+    anom_m = load_anomaly_monthly(FILE_ML)
+    merge_and_analyze_sp500(cot_m, anom_m)
+
+if __name__ == "__main__":
+    main()
