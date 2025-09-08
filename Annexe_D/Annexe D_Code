@@ -295,7 +295,7 @@ def main():
     overlap_year.to_csv("B3_overlap_rb_ml_by_year.csv", index=False)
     overlap_global.to_csv("B3_overlap_global.csv", index=False)
 
-    print("✅ Done.")
+    print("Done.")
     print(" - ml_if_predictions_2015_2024.csv")
     print(" - B2_ml_anomaly_rates_by_year.csv")
     print(" - B3_overlap_rb_ml_by_year.csv")
