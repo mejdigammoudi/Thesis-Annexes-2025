@@ -310,7 +310,7 @@ def main():
 
         with open("S2_cox_summary.txt", "w") as f:
             f.write(str(cph.summary))
-        print("✅ Cox model fitted and summary saved to S2_cox_summary.txt")
+        print("Cox model fitted and summary saved to S2_cox_summary.txt")
 
         # Optional: coefficient plot
         try:
