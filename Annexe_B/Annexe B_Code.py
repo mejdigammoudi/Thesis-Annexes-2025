@@ -199,6 +199,7 @@ diag = (
 )
 diag.to_csv("B1_rule_based_anomaly_rates_by_year.csv", index=False)
 
-print("✅ Done.")
+print("Done.")
 print(f"Main features: {out_main}")
 print("Diagnostics:   B1_rule_based_anomaly_rates_by_year.csv")
+
